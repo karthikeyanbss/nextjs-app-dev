@@ -1,6 +1,14 @@
 'use client'
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  ChangeEvent,
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 
 type Message = {
   role: 'user' | 'assistant'
@@ -43,6 +51,7 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
   const [highlightedSuggestion, setHighlightedSuggestion] = useState<string | null>(null)
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([])
   const chatWindowRef = useRef<HTMLDivElement | null>(null)
 
   const endpointDisplay = useMemo(() => BACKEND_ENDPOINT.replace(/^https?:\/\//, ''), [])
@@ -59,6 +68,29 @@ export default function Home() {
     scrollToBottom()
   }, [messages, isLoading, scrollToBottom])
 
+  const formatFileSize = useCallback((size: number) => {
+    if (size < 1024) {
+      return `${size} B`
+    }
+    if (size < 1024 * 1024) {
+      return `${(size / 1024).toFixed(1)} KB`
+    }
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`
+  }, [])
+
+  const handleFileChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files
+    if (!files?.length) {
+      return
+    }
+    setAttachedFiles((prev) => [...prev, ...Array.from(files)])
+    event.target.value = ''
+  }, [])
+
+  const removeAttachment = useCallback((index: number) => {
+    setAttachedFiles((prev) => prev.filter((_, idx) => idx !== index))
+  }, [])
+
   const submitPrompt = useCallback(
     async (preset?: string) => {
       const trimmed = (preset ?? input).trim()
@@ -72,13 +104,25 @@ export default function Home() {
       setInput('')
 
       try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ prompt: trimmed }),
-        })
+        const hasAttachments = attachedFiles.length > 0
+        const requestInit: RequestInit = hasAttachments
+          ? (() => {
+              const formData = new FormData()
+              formData.append('prompt', trimmed)
+              attachedFiles.forEach((file) => formData.append('files', file))
+              return {
+                method: 'POST',
+                body: formData,
+              }
+            })()
+          : {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ prompt: trimmed }),
+            }
+        const response = await fetch(endpoint, requestInit)
 
         if (!response.ok) {
           const body = await response.text()
@@ -89,6 +133,7 @@ export default function Home() {
         const assistantContent =
           payload.reply ?? payload.answer ?? payload.output ?? payload.response ?? payload.message ?? JSON.stringify(payload)
         setMessages((prev) => [...prev, { role: 'assistant', content: assistantContent }])
+        setAttachedFiles([])
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unable to reach the backend. Please try again.'
         setError(message)
@@ -103,7 +148,7 @@ export default function Home() {
         setIsLoading(false)
       }
     },
-    [endpoint, input, isLoading]
+    [attachedFiles, endpoint, input, isLoading]
   )
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -187,6 +232,36 @@ export default function Home() {
           </div>
 
           {error && <div className="error-card">{error}</div>}
+
+          <div className="attachment-toolbar">
+            <label className="file-label" htmlFor="file-upload">
+              Attach files
+              <input
+                id="file-upload"
+                type="file"
+                multiple
+                accept="image/*,.pdf,.doc,.docx"
+                onChange={handleFileChange}
+              />
+            </label>
+            <p className="file-hint">Supports PNG/JPG/PDF/DOCX — will be sent as multipart data.</p>
+          </div>
+
+          {attachedFiles.length > 0 && (
+            <div className="attachment-cluster" aria-live="polite">
+              {attachedFiles.map((file, index) => (
+                <div className="attachment-pill" key={`${file.name}-${index}`}>
+                  <div>
+                    <strong>{file.name}</strong>
+                    <span>{formatFileSize(file.size)}</span>
+                  </div>
+                  <button type="button" onClick={() => removeAttachment(index)} aria-label={`Remove ${file.name}`}>
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
 
           <form className="composer" onSubmit={handleSubmit}>
             <textarea
