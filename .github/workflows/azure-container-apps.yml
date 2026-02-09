@@ -1,0 +1,130 @@
+name: Azure Container Apps CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AZURE_RESOURCE_GROUP: ner-service-rg
+  ACR_NAME: nerfastapiacr
+  IMAGE_NAME: nextjs-typescript-app
+  CONTAINER_APP_ENVIRONMENT: ner-env
+  CONTAINER_APP_NAME: nextjs-app-dev
+
+jobs:
+  # Build once - single immutable Docker image
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-version: ${{ steps.meta.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # Deploy to nextjs-app-dev
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: dev
+    
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Ensure Container App exists and is healthy
+        env:
+          RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
+          ENVIRONMENT: ${{ env.CONTAINER_APP_ENVIRONMENT }}
+          APP_NAME: ${{ env.CONTAINER_APP_NAME }}
+        run: |
+          set -euo pipefail
+          state=$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query provisioningState -o tsv 2>/dev/null || echo "Missing")
+          if [ "$state" != "Succeeded" ]; then
+            echo "Container app '$APP_NAME' is not ready (state=$state); creating placeholder."
+            az containerapp create \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$ENVIRONMENT" \
+              --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
+              --ingress external \
+              --target-port 80 || true
+            az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP"
+          else
+            echo "Container app '$APP_NAME' is provisioned with state=$state."
+          fi
+
+      - name: Deploy to Azure Container Apps
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
+          containerAppName: ${{ env.CONTAINER_APP_NAME }}
+          containerAppEnvironment: ${{ env.CONTAINER_APP_ENVIRONMENT }}
+          imageToDeploy: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+          acrName: ${{ env.ACR_NAME }}
+          acrUsername: ${{ secrets.ACR_USERNAME }}
+          acrPassword: ${{ secrets.ACR_PASSWORD }}
+          targetPort: 3000
+          environmentVariables: |
+            NEXT_PUBLIC_ENVIRONMENT=dev
+            NEXT_PUBLIC_VERSION=${{ github.sha }}
+            NODE_ENV=production
+          ingress: external
+
+      - name: Get Container App URL
+        run: |
+          FQDN=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+          echo "🚀 Deployed to nextjs-app-dev: https://$FQDN"
